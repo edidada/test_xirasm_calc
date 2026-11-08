@@ -1,0 +1,36 @@
+name: XIRASM 科学计算器 (Windows x64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-run:
+    name: 汇编 + 运行 (windows-2022)
+    runs-on: windows-2022
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 汇编 PE64 计算器
+        shell: pwsh
+        run: ./tools/xirasm.exe build
+
+      - name: 运行三种模式并校验输出
+        shell: pwsh
+        run: ./scripts/verify.ps1
+
+      - name: 上传可执行产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calc-exe-${{ github.run_number }}
+          path: build/app.exe
+          if-no-files-found: warn

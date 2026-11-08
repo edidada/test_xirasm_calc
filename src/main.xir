@@ -1,0 +1,704 @@
+// XIRASM scientific calculator -- PE64 console, Windows x86-64.
+//
+// Input is read from stdin as one expression per line.  Three modes:
+//   <expression>      evaluate and print "expr = value"
+//   table <number>    print a table of scientific functions of that number
+//   selftest          run built-in expression tests, print PASS/FAIL
+// With empty stdin the self-test runs automatically.
+//
+// Grammar (recursive descent):
+//   expr   := term  (('+' | '-') term)*
+//   term   := unary (('*' | '/') unary)*
+//   unary  := ('-' | '+') unary | power
+//   power  := atom  ('^' unary)?            // right associative
+//   atom   := number | constant | ident '(' expr ')' | '(' expr ')'
+//
+// Runtime maths uses SSE2 plus msvcrt.dll imports; console input is Win32
+// ReadFile, output is msvcrt printf.  The entry keeps rsp % 16 == 8 while
+// calling the Win32 IO helpers, then allocates 40 bytes so every later
+// import call is 16-byte aligned with its shadow space.
+
+import("format/format.inc");
+import("io/windows.inc");
+x86.use64();
+
+// ---------------------------------------------------------------------------
+// Compile-time tables
+// ---------------------------------------------------------------------------
+
+const fn_names: list = list.of(
+    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+    "sqrt", "abs", "exp", "ln", "log", "log10", "floor", "ceil", "deg", "rad")
+
+const id_names: list = list.of(
+    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+    "sqrt", "abs", "exp", "ln", "log", "log10", "floor", "ceil", "deg", "rad",
+    "pi", "e", "tau")
+
+const id_codes: list = list.of(
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    100, 101, 102)
+
+const test_exprs: list = list.of(
+    "2+3*4", "(2+3)*4", "2^10", "2^3^2", "-2^2", "sqrt(2)", "sin(pi/6)",
+    "cos(0)", "tan(pi/4)", "exp(1)", "ln(e)", "log10(1000)", "abs(-3.5)",
+    "asin(1)", "atan(1)", "sinh(0)", "cosh(0)", "tanh(1)", "floor(3.7)",
+    "ceil(3.2)", "deg(pi)", "rad(180)", "log(e)")
+
+const test_bits: list = list.of(
+    0x402c000000000000, 0x4034000000000000, 0x4090000000000000,
+    0x4080000000000000, 0xc010000000000000, 0x3ff6a09e667f3bcd,
+    0x3fdfffffffffffff, 0x3ff0000000000000, 0x3ff0000000000000,
+    0x4005bf0a8b145769, 0x3ff0000000000000, 0x4008000000000000,
+    0x400c000000000000, 0x3ff921fb54442d18, 0x3fe921fb54442d18,
+    0x0000000000000000, 0x3ff0000000000000, 0x3fe85efab514f394,
+    0x4008000000000000, 0x4010000000000000, 0x4066800000000000,
+    0x400921fb54442d18, 0x3ff0000000000000)
+
+const id_count: u64 = len(id_names)
+const fn_count: u64 = len(fn_names)
+const test_count: u64 = len(test_exprs)
+
+let imports: map = pe_import_new()
+imports = io_windows64_imports(imports)
+imports = pe_import_use64(imports, "KERNEL32.DLL", "ExitProcess")
+imports = pe_import_use64_many(imports, "msvcrt.dll",
+    list.of("printf", "fflush", "strtod", "strcmp", "strncmp", "pow",
+            "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
+            "tanh", "exp", "log", "log10", "floor", "ceil"))
+
+let image: map = format_pe64(
+    format_pe_exe | format_pe_console | format_pe_nx | format_pe_aslr_auto,
+    list.of(
+        format_section(".text", format_code | format_readable | format_executable),
+        format_section(".rdata", format_data | format_readable),
+        format_section(".data", format_data | format_readable | format_writeable),
+        format_section(".idata", format_imports | format_readable | format_writeable)
+    )
+)
+format_begin(image);
+
+// ---------------------------------------------------------------------------
+// Compile-time output helpers (inlined; caller owns a 40-byte frame)
+// ---------------------------------------------------------------------------
+
+fn printf_text(fmt_label: string) {
+    isa(sym.join("lea rcx, [rel ", fmt_label, "]"));
+    xor eax, eax
+    call [rel printf]
+}
+
+fn printf_val(fmt_label: string) {
+    isa(sym.join("lea rcx, [rel ", fmt_label, "]"));
+    movsd xmm1, [rel result]
+    mov rdx, [rel result]
+    mov eax, 1
+    call [rel printf]
+}
+
+fn printf_line() {
+    lea rcx, [rel fmt_pct_s]
+    mov rdx, r14
+    xor eax, eax
+    call [rel printf]
+}
+
+// ---------------------------------------------------------------------------
+// .text
+// ---------------------------------------------------------------------------
+
+format_section_begin(image, ".text");
+
+start:
+    // --- read all of stdin into input_buf (rsp % 16 == 8 here) ---
+    lea rbx, [rel input_buf]
+    xor r12, r12
+read_loop:
+    lea rsi, [rel input_buf]
+    add rsi, r12
+    mov rdx, 16384
+    sub rdx, r12
+    io_read_stdin()
+    test rax, rax
+    jle read_done
+    add r12, rax
+    cmp r12, 16384
+    jb read_loop
+read_done:
+    mov [rel input_len], r12
+
+    sub rsp, 40                 // 32 shadow + 8 alignment; rsp % 16 -> 0
+
+    test r12, r12
+    jz empty_selftest
+
+    lea r14, [rel input_buf]
+    mov r15, r14
+    add r15, [rel input_len]
+
+lines_loop:
+    cmp r14, r15
+    jae lines_done
+    mov r13, r14
+find_eol:
+    cmp r13, r15
+    jae eol_found
+    cmp byte [r13], 10
+    je eol_found
+    inc r13
+    jmp find_eol
+eol_found:
+    mov byte [r13], 0
+    mov rdi, r13
+    dec rdi
+    cmp rdi, r14
+    jb no_cr
+    cmp byte [rdi], 13
+    jne no_cr
+    mov byte [rdi], 0
+no_cr:
+    // strcmp(line, "selftest")
+    mov rcx, r14
+    lea rdx, [rel selftest_str]
+    call [rel strcmp]
+    test eax, eax
+    je line_selftest
+    // strncmp(line, "table ", 6)
+    mov rcx, r14
+    lea rdx, [rel table_str]
+    mov r8d, 6
+    call [rel strncmp]
+    test eax, eax
+    je line_table
+    jmp line_expr
+
+line_table:
+    mov rsi, r14
+    add rsi, 6
+    mov rcx, rsi
+    lea rdx, [rel strtod_end]
+    call [rel strtod]
+    movsd [rel table_x], xmm0
+    movsd [rel result], xmm0
+    printf_val("fmt_tbl_header")
+    for i in range(0, fn_count) {
+        const nm: string = list.get(fn_names, i)
+        isa(sym.join("mov eax, ", i + 1));
+        movsd xmm0, [rel table_x]
+        call call_func
+        movsd [rel result], xmm0
+        printf_val(sym.join("fmt_tbl_", nm))
+    }
+    // Derived values: x^2, x^3, 1/x
+    movsd xmm0, [rel table_x]
+    mulsd xmm0, [rel table_x]
+    movsd [rel result], xmm0
+    printf_val("fmt_x2")
+    movsd xmm0, [rel result]
+    mulsd xmm0, [rel table_x]
+    movsd [rel result], xmm0
+    printf_val("fmt_x3")
+    movsd xmm0, [rel one_const]
+    divsd xmm0, [rel table_x]
+    movsd [rel result], xmm0
+    printf_val("fmt_inv")
+    jmp line_next
+
+line_expr:
+    mov rsi, r14
+    mov byte [rel parse_error], 0
+    call parse_expr
+    call skip_ws
+    cmp byte [rsi], 0
+    jne expr_bad
+    cmp byte [rel parse_error], 0
+    jne expr_bad
+    movsd [rel result], xmm0
+    printf_line()
+    printf_val("fmt_eq")
+    jmp line_next
+expr_bad:
+    printf_text("fmt_err")
+    jmp line_next
+
+line_selftest:
+    call run_selftest_body
+    jmp line_next
+
+line_next:
+    lea r14, [r13 + 1]
+    jmp lines_loop
+
+lines_done:
+    jmp program_exit
+
+empty_selftest:
+    call run_selftest_body
+
+program_exit:
+    xor ecx, ecx
+    call [rel fflush]
+    movzx ecx, byte [rel exit_code]
+    call [rel ExitProcess]
+    hlt
+
+// ---------------------------------------------------------------------------
+// Self-test body (generated once per case at assembly time)
+// ---------------------------------------------------------------------------
+
+run_selftest_body:
+    sub rsp, 40
+    printf_text("fmt_st_header")
+    for i in range(0, test_count) {
+        const expr: string = list.get(test_exprs, i)
+        const expr_lbl: string = sym.join("test_expr_", i)
+        const exp_lbl: string = sym.join("exp_val_", i)
+        const pass_lbl: string = sym.join("fmt_pass_", i)
+        const fail_lbl: string = sym.join("fmt_fail_", i)
+        const fail_j: string = sym.join("st_fail_", i)
+        const done_j: string = sym.join("st_done_", i)
+        isa(sym.join("lea rsi, [rel ", expr_lbl, "]"));
+        mov byte [rel parse_error], 0
+        call parse_expr
+        movsd [rel result], xmm0
+        cmp byte [rel parse_error], 0
+        isa(sym.join("jne ", fail_j));
+        isa(sym.join("subsd xmm0, [rel ", exp_lbl, "]"));
+        movsd xmm1, [rel abs_mask]
+        andpd xmm0, xmm1
+        ucomisd xmm0, [rel tolerance]
+        isa(sym.join("jp ", fail_j));
+        isa(sym.join("ja ", fail_j));
+        printf_val(pass_lbl)
+        isa(sym.join("jmp ", done_j));
+        label.define(fail_j);
+        printf_text(fail_lbl)
+        mov byte [rel exit_code], 1
+        label.define(done_j);
+    }
+    add rsp, 40
+    ret
+
+// ---------------------------------------------------------------------------
+// Function dispatch: rax = code, xmm0 = value, returns xmm0 = f(value)
+// ---------------------------------------------------------------------------
+
+call_func:
+    sub rsp, 40
+    for i in range(0, fn_count) {
+        const nm: string = list.get(fn_names, i)
+        isa(sym.join("cmp eax, ", i + 1));
+        isa(sym.join("je cf_", nm));
+    }
+    jmp cf_end
+
+    label.define("cf_sin");
+    call [rel sin]
+    jmp cf_end
+    label.define("cf_cos");
+    call [rel cos]
+    jmp cf_end
+    label.define("cf_tan");
+    call [rel tan]
+    jmp cf_end
+    label.define("cf_asin");
+    call [rel asin]
+    jmp cf_end
+    label.define("cf_acos");
+    call [rel acos]
+    jmp cf_end
+    label.define("cf_atan");
+    call [rel atan]
+    jmp cf_end
+    label.define("cf_sinh");
+    call [rel sinh]
+    jmp cf_end
+    label.define("cf_cosh");
+    call [rel cosh]
+    jmp cf_end
+    label.define("cf_tanh");
+    call [rel tanh]
+    jmp cf_end
+    label.define("cf_sqrt");
+    sqrtsd xmm0, xmm0
+    jmp cf_end
+    label.define("cf_abs");
+    movsd xmm1, [rel abs_mask]
+    andpd xmm0, xmm1
+    jmp cf_end
+    label.define("cf_exp");
+    call [rel exp]
+    jmp cf_end
+    label.define("cf_ln");
+    call [rel log]
+    jmp cf_end
+    label.define("cf_log");
+    call [rel log]
+    jmp cf_end
+    label.define("cf_log10");
+    call [rel log10]
+    jmp cf_end
+    label.define("cf_floor");
+    call [rel floor]
+    jmp cf_end
+    label.define("cf_ceil");
+    call [rel ceil]
+    jmp cf_end
+    label.define("cf_deg");
+    mulsd xmm0, [rel deg_factor]
+    jmp cf_end
+    label.define("cf_rad");
+    mulsd xmm0, [rel rad_factor]
+    jmp cf_end
+cf_end:
+    add rsp, 40
+    ret
+
+// ---------------------------------------------------------------------------
+// Recursive-descent parser.  rsi is a shared input pointer; every routine
+// returns its value in xmm0 and keeps a 40-byte frame (rsp % 16 == 0).
+// ---------------------------------------------------------------------------
+
+skip_ws:
+    cmp byte [rsi], 0x20
+    je ws_next
+    cmp byte [rsi], 0x09
+    je ws_next
+    cmp byte [rsi], 0x0d
+    je ws_next
+    ret
+ws_next:
+    inc rsi
+    jmp skip_ws
+
+parse_number:
+    sub rsp, 40
+    mov rcx, rsi
+    lea rdx, [rel strtod_end]
+    call [rel strtod]
+    mov rsi, [rel strtod_end]
+    add rsp, 40
+    ret
+
+parse_atom:
+    sub rsp, 40
+    call skip_ws
+    movzx eax, byte [rsi]
+    cmp eax, 0x28
+    je atom_paren
+    cmp eax, 0x2e
+    je atom_number
+    cmp eax, 0x30
+    jb atom_ident
+    cmp eax, 0x39
+    jbe atom_number
+    jmp atom_ident
+
+atom_number:
+    call parse_number
+    jmp atom_done
+
+atom_paren:
+    inc rsi
+    call parse_expr
+    call skip_ws
+    cmp byte [rsi], 0x29
+    jne atom_error
+    inc rsi
+    jmp atom_done
+
+atom_ident:
+    // Scan [A-Za-z0-9_] into an 8-byte zero-padded little-endian key in r11.
+    xor r11, r11
+    xor r9, r9
+ident_scan:
+    movzx edx, byte [rsi]
+    cmp dl, 0x41
+    jb ident_chk_lower
+    cmp dl, 0x5a
+    ja ident_chk_lower
+    or dl, 0x20
+    jmp ident_accept
+ident_chk_lower:
+    cmp dl, 0x61
+    jb ident_chk_digit
+    cmp dl, 0x7a
+    ja ident_chk_digit
+    jmp ident_accept
+ident_chk_digit:
+    cmp dl, 0x30
+    jb ident_scan_done
+    cmp dl, 0x39
+    ja ident_scan_done
+ident_accept:
+    cmp r9, 8
+    jae ident_advance
+    mov rcx, r9
+    shl rcx, 3
+    shl rdx, cl
+    or r11, rdx
+ident_advance:
+    inc r9
+    inc rsi
+    jmp ident_scan
+ident_scan_done:
+    // Look the key up in the 16-byte-entry identifier table.
+    xor r8, r8
+ident_lookup:
+    isa(sym.join("cmp r8, ", id_count));
+    jae ident_not_found
+    lea r10, [rel ident_table]
+    mov rax, r8
+    shl rax, 4
+    add r10, rax
+    mov rax, [r10]
+    cmp r11, rax
+    je ident_found
+    inc r8
+    jmp ident_lookup
+ident_found:
+    movzx eax, byte [r10 + 8]
+    jmp ident_have_code
+ident_not_found:
+    xor eax, eax
+ident_have_code:
+    test rax, rax
+    jz atom_error
+    cmp eax, 100
+    jae atom_constant
+    // Function call: ident '(' expr ')'
+    mov [rsp + 32], eax
+    call skip_ws
+    cmp byte [rsi], 0x28
+    jne atom_error
+    inc rsi
+    call parse_expr
+    mov eax, [rsp + 32]
+    call skip_ws
+    cmp byte [rsi], 0x29
+    jne atom_error
+    inc rsi
+    call call_func
+    jmp atom_done
+
+atom_constant:
+    sub eax, 100
+    shl rax, 3
+    lea rdx, [rel const_table]
+    add rdx, rax
+    movsd xmm0, [rdx]
+    jmp atom_done
+
+atom_error:
+    mov byte [rel parse_error], 1
+    xorpd xmm0, xmm0
+atom_done:
+    add rsp, 40
+    ret
+
+parse_power:
+    sub rsp, 40
+    call parse_atom
+    call skip_ws
+    cmp byte [rsi], 0x5e
+    jne power_done
+    inc rsi
+    movsd [rsp + 32], xmm0
+    call parse_unary
+    movsd xmm1, xmm0          // exponent
+    movsd xmm0, [rsp + 32]    // base
+    call [rel pow]
+power_done:
+    add rsp, 40
+    ret
+
+parse_unary:
+    sub rsp, 40
+    call skip_ws
+    movzx eax, byte [rsi]
+    cmp eax, 0x2d
+    je unary_neg
+    cmp eax, 0x2b
+    je unary_pos
+    call parse_power
+    jmp unary_done
+unary_neg:
+    inc rsi
+    call parse_unary
+    movsd xmm1, [rel sign_mask]
+    xorpd xmm0, xmm1
+    jmp unary_done
+unary_pos:
+    inc rsi
+    call parse_unary
+unary_done:
+    add rsp, 40
+    ret
+
+parse_term:
+    sub rsp, 40
+    call parse_unary
+term_loop:
+    call skip_ws
+    movzx eax, byte [rsi]
+    cmp eax, 0x2a
+    je term_mul
+    cmp eax, 0x2f
+    je term_div
+    jmp term_done
+term_mul:
+    inc rsi
+    movsd [rsp + 32], xmm0
+    call parse_unary
+    mulsd xmm0, [rsp + 32]
+    jmp term_loop
+term_div:
+    inc rsi
+    movsd [rsp + 32], xmm0
+    call parse_unary
+    movsd xmm1, [rsp + 32]
+    divsd xmm1, xmm0
+    movapd xmm0, xmm1
+    jmp term_loop
+term_done:
+    add rsp, 40
+    ret
+
+parse_expr:
+    sub rsp, 40
+    call parse_term
+expr_loop:
+    call skip_ws
+    movzx eax, byte [rsi]
+    cmp eax, 0x2b
+    je expr_add
+    cmp eax, 0x2d
+    je expr_sub
+    jmp expr_done
+expr_add:
+    inc rsi
+    movsd [rsp + 32], xmm0
+    call parse_term
+    addsd xmm0, [rsp + 32]
+    jmp expr_loop
+expr_sub:
+    inc rsi
+    movsd [rsp + 32], xmm0
+    call parse_term
+    movsd xmm1, [rsp + 32]
+    subsd xmm1, xmm0
+    movapd xmm0, xmm1
+    jmp expr_loop
+expr_done:
+    add rsp, 40
+    ret
+
+format_section_end(image, ".text");
+
+// ---------------------------------------------------------------------------
+// .rdata -- strings, identifier table, constants, generated formats
+// ---------------------------------------------------------------------------
+
+format_section_begin(image, ".rdata");
+
+selftest_str:
+    db("selftest", 0)
+table_str:
+    db("table ", 0)
+fmt_pct_s:
+    db("%s", 0)
+fmt_eq:
+    db(" = %.10g", 10, 0)
+fmt_err:
+    db("error: invalid expression", 10, 0)
+fmt_st_header:
+    db("--- selftest ---", 10, 0)
+fmt_tbl_header:
+    db("table for x = %.10g", 10, 0)
+fmt_x2:
+    db("  x^2 = %.10g", 10, 0)
+fmt_x3:
+    db("  x^3 = %.10g", 10, 0)
+fmt_inv:
+    db("  1/x = %.10g", 10, 0)
+
+// Identifier lookup table: 8-byte padded name + 1-byte code + 7 pad = 16.
+ident_table:
+for i in range(0, id_count) {
+    const nm: string = list.get(id_names, i)
+    const code: u64 = list.get(id_codes, i)
+    db(nm);
+    db(bytes.repeat(8 - len(nm), 0));
+    db(code);
+    db(bytes.repeat(7, 0));
+}
+
+// pi, e, tau
+const_table:
+    dq(0x400921fb54442d18)
+    dq(0x4005bf0a8b145769)
+    dq(0x401921fb54442d18)
+
+abs_mask:
+    dq(0x7fffffffffffffff)
+sign_mask:
+    dq(0x8000000000000000)
+deg_factor:
+    dq(0x404ca5dc1a63c1f8)
+rad_factor:
+    dq(0x3f91df46a2529d39)
+tolerance:
+    dq(0x3e112e0be826d695)
+one_const:
+    dq(0x3ff0000000000000)
+
+// Per-function table output formats.
+for i in range(0, fn_count) {
+    const nm: string = list.get(fn_names, i)
+    label.define(sym.join("fmt_tbl_", nm));
+    db("  ", nm, "(x) = %.10g", 10, 0);
+}
+
+// Per-case self-test data and formats.
+for i in range(0, test_count) {
+    const expr: string = list.get(test_exprs, i)
+    const bits: u64 = list.get(test_bits, i)
+    label.define(sym.join("test_expr_", i));
+    db(expr, 0);
+    label.define(sym.join("exp_val_", i));
+    dq(bits);
+    label.define(sym.join("fmt_pass_", i));
+    db("PASS ", expr, " = %.10g", 10, 0);
+    label.define(sym.join("fmt_fail_", i));
+    db("FAIL ", expr, 10, 0);
+}
+
+format_section_end(image, ".rdata");
+
+// ---------------------------------------------------------------------------
+// .data -- writable buffers and state
+// ---------------------------------------------------------------------------
+
+format_section_begin(image, ".data");
+
+input_buf:
+    db(bytes.repeat(16385, 0))
+input_len:
+    dq(0)
+table_x:
+    dq(0)
+result:
+    dq(0)
+strtod_end:
+    dq(0)
+parse_error:
+    db(0)
+exit_code:
+    db(0)
+
+format_section_end(image, ".data");
+
+format_pe_import_section(image, ".idata", imports);
+
+format_entry_mut(image, start)
+format_finish(image);
