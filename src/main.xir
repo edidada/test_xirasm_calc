@@ -1,4 +1,4 @@
-// XIRASM scientific calculator -- PE64 console, Windows x86-64.
+// XIRASM scientific calculator -- ELF64 console, Linux x86-64.
 //
 // Input is read from stdin as one expression per line.  Three modes:
 //   <expression>      evaluate and print "expr = value"
@@ -13,13 +13,14 @@
 //   power  := atom  ('^' unary)?            // right associative
 //   atom   := number | constant | ident '(' expr ')' | '(' expr ')'
 //
-// Runtime maths uses SSE2 plus msvcrt.dll imports; console input is Win32
-// ReadFile, output is msvcrt printf.  The entry keeps rsp % 16 == 8 while
-// calling the Win32 IO helpers, then allocates 40 bytes so every later
-// import call is 16-byte aligned with its shadow space.
+// Runtime maths uses SSE2 plus libc/libm imports reached through ELF GOT
+// slots; console input is a direct Linux read(2) syscall, output is libc
+// printf.  Linux enters _start with rsp % 16 == 0, so the entry only keeps
+// that alignment; internal routines keep a 40-byte frame so every libc call
+// is made with rsp % 16 == 0, as the System V AMD64 ABI requires.
 
 import("format/format.inc");
-import("io/windows.inc");
+import("io/linux.inc");
 x86.use64();
 
 // ---------------------------------------------------------------------------
@@ -59,58 +60,56 @@ const id_count: u64 = len(id_names)
 const fn_count: u64 = len(fn_names)
 const test_count: u64 = len(test_exprs)
 
-let imports: map = pe_import_new()
-imports = io_windows64_imports(imports)
-imports = pe_import_use64(imports, "KERNEL32.DLL", "ExitProcess")
-imports = pe_import_use64_many(imports, "msvcrt.dll",
-    list.of("printf", "fflush", "strtod", "strcmp", "strncmp", "pow",
-            "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
-            "tanh", "exp", "log", "log10", "floor", "ceil"))
+let imports: list = format_elfexe_import_new()
+format_elfexe_import_slots_mut(imports, "libc.so.6",
+    list.of("printf", "fflush", "strtod", "strcmp", "strncmp"))
+format_elfexe_import_slots_mut(imports, "libm.so.6",
+    list.of("pow", "sin", "cos", "tan", "asin", "acos", "atan",
+            "sinh", "cosh", "tanh", "exp", "log", "log10", "floor", "ceil"))
 
-let image: map = format_pe64(
-    format_pe_exe | format_pe_console | format_pe_nx | format_pe_aslr_auto,
+let image: map = format_elf64(
+    format_elf_exec,
     list.of(
-        format_section(".text", format_code | format_readable | format_executable),
-        format_section(".rdata", format_data | format_readable),
-        format_section(".data", format_data | format_readable | format_writeable),
-        format_section(".idata", format_imports | format_readable | format_writeable)
+        format_segment("text", format_load | format_readable | format_executable),
+        format_segment("rodata", format_load | format_readable),
+        format_segment("data", format_load | format_readable | format_writeable)
     )
 )
+format_elfexe_tables_mut(image, imports);
 format_begin(image);
 
 // ---------------------------------------------------------------------------
-// Compile-time output helpers (inlined; caller owns a 40-byte frame)
+// Compile-time output helpers (inlined; System V AMD64 varargs)
 // ---------------------------------------------------------------------------
 
 fn printf_text(fmt_label: string) {
-    isa(sym.join("lea rcx, [rel ", fmt_label, "]"));
+    isa(sym.join("lea rdi, [rel ", fmt_label, "]"));
     xor eax, eax
     call [rel printf]
 }
 
 fn printf_val(fmt_label: string) {
-    isa(sym.join("lea rcx, [rel ", fmt_label, "]"));
-    movsd xmm1, [rel result]
-    mov rdx, [rel result]
+    isa(sym.join("lea rdi, [rel ", fmt_label, "]"));
+    movsd xmm0, [rel result]
     mov eax, 1
     call [rel printf]
 }
 
 fn printf_line() {
-    lea rcx, [rel fmt_pct_s]
-    mov rdx, r14
+    lea rdi, [rel fmt_pct_s]
+    mov rsi, r14
     xor eax, eax
     call [rel printf]
 }
 
 // ---------------------------------------------------------------------------
-// .text
+// text
 // ---------------------------------------------------------------------------
 
-format_section_begin(image, ".text");
+format_segment_begin(image, "text");
 
 start:
-    // --- read all of stdin into input_buf (rsp % 16 == 8 here) ---
+    // --- read all of stdin into input_buf (Linux _start: rsp % 16 == 0) ---
     lea rbx, [rel input_buf]
     xor r12, r12
 read_loop:
@@ -127,7 +126,7 @@ read_loop:
 read_done:
     mov [rel input_len], r12
 
-    sub rsp, 40                 // 32 shadow + 8 alignment; rsp % 16 -> 0
+    and rsp, -16               // keep the System V 16-byte stack alignment
 
     test r12, r12
     jz empty_selftest
@@ -158,15 +157,15 @@ eol_found:
     mov byte [rdi], 0
 no_cr:
     // strcmp(line, "selftest")
-    mov rcx, r14
-    lea rdx, [rel selftest_str]
+    mov rdi, r14
+    lea rsi, [rel selftest_str]
     call [rel strcmp]
     test eax, eax
     je line_selftest
     // strncmp(line, "table ", 6)
-    mov rcx, r14
-    lea rdx, [rel table_str]
-    mov r8d, 6
+    mov rdi, r14
+    lea rsi, [rel table_str]
+    mov edx, 6
     call [rel strncmp]
     test eax, eax
     je line_table
@@ -175,8 +174,8 @@ no_cr:
 line_table:
     mov rsi, r14
     add rsi, 6
-    mov rcx, rsi
-    lea rdx, [rel strtod_end]
+    mov rdi, rsi
+    lea rsi, [rel strtod_end]
     call [rel strtod]
     movsd [rel table_x], xmm0
     movsd [rel result], xmm0
@@ -236,11 +235,11 @@ empty_selftest:
     call run_selftest_body
 
 program_exit:
-    xor ecx, ecx
+    xor edi, edi
     call [rel fflush]
-    movzx ecx, byte [rel exit_code]
-    call [rel ExitProcess]
-    hlt
+    movzx edi, byte [rel exit_code]
+    mov eax, 60
+    syscall
 
 // ---------------------------------------------------------------------------
 // Self-test body (generated once per case at assembly time)
@@ -285,6 +284,7 @@ run_selftest_body:
 
 call_func:
     sub rsp, 40
+    mov [rsp + 24], rsi         // System V: libc may clobber rsi
     for i in range(0, fn_count) {
         const nm: string = list.get(fn_names, i)
         isa(sym.join("cmp eax, ", i + 1));
@@ -351,6 +351,7 @@ call_func:
     mulsd xmm0, [rel rad_factor]
     jmp cf_end
 cf_end:
+    mov rsi, [rsp + 24]
     add rsp, 40
     ret
 
@@ -373,8 +374,8 @@ ws_next:
 
 parse_number:
     sub rsp, 40
-    mov rcx, rsi
-    lea rdx, [rel strtod_end]
+    mov rdi, rsi
+    lea rsi, [rel strtod_end]
     call [rel strtod]
     mov rsi, [rel strtod_end]
     add rsp, 40
@@ -507,7 +508,9 @@ parse_power:
     call parse_unary
     movsd xmm1, xmm0          // exponent
     movsd xmm0, [rsp + 32]    // base
+    mov [rsp + 24], rsi       // preserve the input pointer across pow()
     call [rel pow]
+    mov rsi, [rsp + 24]
 power_done:
     add rsp, 40
     ret
@@ -593,13 +596,13 @@ expr_done:
     add rsp, 40
     ret
 
-format_section_end(image, ".text");
+format_segment_end(image, "text");
 
 // ---------------------------------------------------------------------------
-// .rdata -- strings, identifier table, constants, generated formats
+// rodata -- strings, identifier table, constants, generated formats
 // ---------------------------------------------------------------------------
 
-format_section_begin(image, ".rdata");
+format_segment_begin(image, "rodata");
 
 selftest_str:
     db("selftest", 0)
@@ -673,13 +676,13 @@ for i in range(0, test_count) {
     db("FAIL ", expr, 10, 0);
 }
 
-format_section_end(image, ".rdata");
+format_segment_end(image, "rodata");
 
 // ---------------------------------------------------------------------------
-// .data -- writable buffers and state
+// data -- writable buffers and state
 // ---------------------------------------------------------------------------
 
-format_section_begin(image, ".data");
+format_segment_begin(image, "data");
 
 input_buf:
     db(bytes.repeat(16385, 0))
@@ -696,9 +699,7 @@ parse_error:
 exit_code:
     db(0)
 
-format_section_end(image, ".data");
-
-format_pe_import_section(image, ".idata", imports);
+format_segment_end(image, "data");
 
 format_entry_mut(image, start)
 format_finish(image);

@@ -1,0 +1,54 @@
+name: XIRASM 科学计算器 (Linux x86-64 / ELF64)
+
+on:
+  push:
+    branches: [linux-x86-64]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  assemble:
+    name: 汇编 ELF64 (windows-2022)
+    runs-on: windows-2022
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 汇编 ELF64 计算器
+        shell: pwsh
+        run: ./tools/xirasm.exe build
+
+      - name: 上传 ELF 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: calc-elf64
+          path: build/app
+          if-no-files-found: error
+
+  verify:
+    name: 运行并校验 (ubuntu-latest)
+    needs: assemble
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 ELF 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: calc-elf64
+          path: build
+
+      - name: 检查 ELF 结构
+        run: |
+          chmod +x build/app
+          file build/app
+          readelf -h -l -d -r build/app
+          ldd build/app || true
+
+      - name: 运行三种模式并校验输出
+        run: bash scripts/verify.sh

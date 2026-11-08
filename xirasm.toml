@@ -4,10 +4,10 @@ version = "0.1.0"
 
 [build]
 source = "src/main.xir"
-output = "build/app.exe"
+output = "build/app"
 
 [target]
 isa = "x86-64"
 bits = 64
-os = "windows"
-abi = "msvc"
+os = "linux"
+abi = "sysv"
