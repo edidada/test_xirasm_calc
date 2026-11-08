@@ -1,0 +1,6 @@
+# 统一编码与换行：所有文本按 UTF-8 / LF 入库，保证 Windows runner 上字节一致
+* text=auto eol=lf
+
+# 二进制文件禁止任何转换（本机 core.autocrlf=true，显式声明更稳妥）
+*.exe binary
+*.bin binary
